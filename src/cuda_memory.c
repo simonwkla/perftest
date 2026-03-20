@@ -324,7 +324,7 @@ int cuda_memory_allocate_buffer(struct memory_ctx *ctx, int alignment, uint64_t 
 			*can_init = false;
 			break;
 		case CUDA_MEM_BOUNCE:
-			error = cuda_allocate_bounce_buffer(cuda_ctx. size, dmabuf_fd, dmabuf_offset, addr, can_init);
+			error = cuda_allocate_bounce_buffer(cuda_ctx, size, dmabuf_fd, dmabuf_offset, addr, can_init);
 			// TEO_TODO: Handle error somehow
 			break;
 
