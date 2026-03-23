@@ -214,9 +214,24 @@ int cuda_memory_destroy(struct memory_ctx *ctx) {
 	return SUCCESS;
 }
 
+int cuda_copy_to_bounce_buffer(struct memory_ctx* ctx, size_t size)
+{
+	if(!bounce_buffer_active) {
+		return SUCCESS;
+	}
+
+	struct cuda_memory_ctx *cuda_ctx = container_of(ctx, struct cuda_memory_ctx, base);
+	printf(">> Doing bounce buffer copy\n");
+	printf(">> GPU Addr: %p, CPU addr: %p, size: %d",
+			cuda_ctx->gpu_bounce_buf_addr, cuda_ctx->cpu_bounce_buf_addr, size);
+
+	return FAILURE;
+}
+
 static int cuda_allocate_bounce_buffer(struct cuda_memory_ctx *cuda_ctx, uint64_t size, int *dmabuf_fd,
 		uint64_t *dmabuf_offset, void **addr, bool *can_init) {
 	printf(" >> Allocating memory for bounce buffer!!!\n");
+	bounce_buffer_active = true;
 	// Align to GPU page size
 	// TEO_TODO: Make sure to only copy `size`, NOT `buf_size`
 	size_t buf_size = (size + ACCEL_PAGE_SIZE - 1) & ~(ACCEL_PAGE_SIZE - 1);
@@ -644,6 +659,7 @@ struct memory_ctx *cuda_memory_create(struct perftest_parameters *params) {
 	ctx->base.validation_start = cuda_validation_start;
 	ctx->base.validation_stop = cuda_validation_stop;
 	ctx->base.validation_destroy = cuda_validation_destroy;
+	ctx->base.copy_to_bounce_buffer = cuda_copy_to_bounce_buffer;
 	ctx->device_id = params->cuda_device_id;
 	ctx->device_bus_id = params->cuda_device_bus_id;
 	ctx->use_dmabuf = params->use_cuda_dmabuf;
