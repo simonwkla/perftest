@@ -651,6 +651,8 @@ static void usage(const char *argv0, VerbType verb, TestType tst, int connection
 			printf(" Use CUDA specific device for GPUDirect RDMA testing\n");
 			printf("      --cuda_mem_type=<value>");
 			printf(" Set CUDA memory type <value>=0(device,default),1(managed),4(malloc)\n");
+			printf("      --use_bounce_buffer=<cuda device id>");
+			printf(" Allocate memory on GPU and copy to host before RDMA\n");
 
 			printf("      --use_cuda_bus_id=<cuda full BUS id>");
 			printf(" Use CUDA specific device, based on its full PCIe address, for GPUDirect RDMA testing\n");
@@ -2773,6 +2775,7 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 	static int retry_count_flag = 0;
 	static int dont_xchg_versions_flag = 0;
 	static int use_cuda_flag = 0;
+	static int use_bounce_buffer_flag = 0;
 	static int use_cuda_bus_id_flag = 0;
 	static int use_cuda_dmabuf_flag = 0;
 	static int use_cuda_pcie_mapping_flag = 0;
@@ -2969,6 +2972,7 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 			{ .name = "dont_xchg_versions",	.has_arg = 0, .flag = &dont_xchg_versions_flag, .val = 1},
 			{ .name = "payload_file_path",	.has_arg = 1, .flag = &payload_flag, .val = 1},
 			{ .name = "use_cuda",		.has_arg = 1, .flag = &use_cuda_flag, .val = 1},
+			{ .name = "use_bounce_buffer", .has_arg = 1, .flag= &use_bounce_buffer_flag, .val=1}, // TEO
 			{ .name = "use_cuda_bus_id",	.has_arg = 1, .flag = &use_cuda_bus_id_flag, .val = 1},
 			{ .name = "use_cuda_dmabuf",	.has_arg = 0, .flag = &use_cuda_dmabuf_flag, .val = 1},
 			{ .name = "use_cuda_pcie_mapping", .has_arg = 0, .flag = &use_cuda_pcie_mapping_flag, .val = 1},
@@ -3430,7 +3434,7 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 					user_param->use_odp = 1;
 				}
 				/* We statically define memory type options so check if requested option is actually supported. */
-				if (((use_cuda_flag || use_cuda_bus_id_flag) && !cuda_memory_supported()) ||
+				if (((use_cuda_flag || use_cuda_bus_id_flag || use_bounce_buffer_flag) && !cuda_memory_supported()) ||
 				    (use_cuda_dmabuf_flag && !cuda_memory_dmabuf_supported()) ||
 				    (use_rocm_flag && !rocm_memory_supported()) ||
 				    (use_rocm_dmabuf_flag && !rocm_memory_dmabuf_supported()) ||
@@ -3453,7 +3457,7 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 				    (mmap_file_flag || use_mlu_flag || use_neuron_flag || use_hl_flag ||
 						use_ib_dm_dmabuf_flag ||
 					 (use_rocm_flag && user_param->memory_type != MEMORY_ROCM) ||
-				     ((use_cuda_flag || use_cuda_bus_id_flag) && user_param->memory_type != MEMORY_CUDA))) {
+				     ((use_cuda_flag || use_cuda_bus_id_flag || use_bounce_buffer_flag) && user_param->memory_type != MEMORY_CUDA))) {
 					fprintf(stderr, " Can't use multiple memory types\n");
 					return FAILURE;
 				}
@@ -3462,6 +3466,13 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 					user_param->memory_type = MEMORY_CUDA;
 					user_param->memory_create = cuda_memory_create;
 					use_cuda_flag = 0;
+				}
+				if (use_bounce_buffer_flag) { // TEO_TODO: If this works, I can probably fold this into cuda_mem_type flag
+					CHECK_VALUE_NON_NEGATIVE(user_param->cuda_device_id,int,"CUDA device",not_int_ptr);
+					user_param->memory_type = MEMORY_CUDA;
+					user_param->cuda_mem_type = CUDA_MEM_BOUNCE;
+					user_param->memory_create = cuda_memory_create;
+					use_bounce_buffer_flag = 0;
 				}
 				if (use_cuda_bus_id_flag) {
 					user_param->cuda_device_bus_id = strdup(optarg);
@@ -3487,7 +3498,7 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 					user_param->use_cuda_pcie_mapping = 1;
 					use_cuda_pcie_mapping_flag = 0;
 				}
-				if (cuda_mem_type_flag) {
+				if (cuda_mem_type_flag) { //TEO_TODO: For full robustness this should also take into account CUDA_MEM_BOUNCE
 					user_param->cuda_mem_type = strtol(optarg,NULL,0);
 					if (user_param->memory_type != MEMORY_CUDA) {
 						fprintf(stderr, "CUDA MEM TYPE cannot be used without CUDA\n");

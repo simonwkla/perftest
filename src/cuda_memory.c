@@ -13,6 +13,8 @@
 
 static int kernel_plugin_initialized = 0;
 static void cuda_validation_destroy(struct memory_ctx *ctx);
+// TEO
+static bool bounce_buffer_active = false;
 
 #define CUCHECK(stmt) \
 	do { \
@@ -28,6 +30,7 @@ static const char *cuda_mem_type_str[] = {
 	"CUDA_MEM_HOSTALLOC",
 	"CUDA_MEM_HOSTREGISTER",
 	"CUDA_MEM_MALLOC",
+	"CUDA_MEM_BOUNCE", // TEO
 	"CUDA_MEM_TYPES"
 };
 
@@ -44,6 +47,9 @@ struct cuda_memory_ctx {
 	bool use_pcie_mapping;
 	int driver_version;
 	int validation_active; /* 1 if plugin validation is active */
+	// TEO
+	void* gpu_bounce_buf_addr;
+	void* cpu_bounce_buf_addr;
 };
 
 static int init_gpu(struct cuda_memory_ctx *ctx)
@@ -208,6 +214,78 @@ int cuda_memory_destroy(struct memory_ctx *ctx) {
 	return SUCCESS;
 }
 
+int cuda_copy_to_bounce_buffer(struct memory_ctx* ctx, size_t size)
+{
+	if(!bounce_buffer_active) {
+		return SUCCESS;
+	}
+
+	struct cuda_memory_ctx *cuda_ctx = container_of(ctx, struct cuda_memory_ctx, base);
+	//printf(">> Doing bounce buffer copy\n");
+	//printf(">> GPU Addr: %p, CPU addr: %p, size: %d",
+	//	cuda_ctx->gpu_bounce_buf_addr, cuda_ctx->cpu_bounce_buf_addr, size);
+	CUdeviceptr cpu_side = (CUdeviceptr)cuda_ctx->cpu_bounce_buf_addr;
+	CUdeviceptr gpu_side = (CUdeviceptr)cuda_ctx->gpu_bounce_buf_addr;
+	int error = p_cuMemcpy(cpu_side, gpu_side, size);
+	if (error != CUDA_SUCCESS) {
+		fprintf(stderr, "cuda_bounce: cuMemcpy DtoH failed: %d\n", error);
+		return FAILURE;
+	}
+
+	return SUCCESS;
+}
+
+static int cuda_allocate_bounce_buffer(struct cuda_memory_ctx *cuda_ctx, uint64_t size, int *dmabuf_fd,
+		uint64_t *dmabuf_offset, void **addr, bool *can_init) {
+	printf(" >> Allocating memory for bounce buffer!!!\n");
+	bounce_buffer_active = true;
+	// Align to GPU page size
+	// TEO_TODO: Make sure to only copy `size`, NOT `buf_size`
+	size_t buf_size = (size + ACCEL_PAGE_SIZE - 1) & ~(ACCEL_PAGE_SIZE - 1);
+	int error;
+
+	// Only treat the discrete GPU case for now
+	int cuda_device_integrated;
+	p_cuDeviceGetAttribute(&cuda_device_integrated, CU_DEVICE_ATTRIBUTE_INTEGRATED, cuda_ctx->cuDevice);
+	printf("CUDA device integrated: %X\n", (unsigned int)cuda_device_integrated);
+	if (cuda_device_integrated == 1) {
+		printf("Bounce buffer currently does not support integrated GPUs\n");
+		return FAILURE;
+	}
+
+	CUdeviceptr d_A;
+	error = p_cuMemAlloc(&d_A, buf_size);
+	if (error != CUDA_SUCCESS) {
+		printf("cuMemAlloc error=%d\n", error);
+		return FAILURE;
+	}
+
+	cuda_ctx->gpu_bounce_buf_addr = (void*)d_A;
+
+#ifdef HAVE_CUDA_DMABUF
+	printf("CUDA dmabuf not supported yet by bounce buffer implementation\n");
+	return FAILURE;
+#else
+	*dmabuf_fd = 0;
+	*dmabuf_offset = 0;
+#endif
+
+	// Allocate CPU side buffer
+	error = p_cuMemAllocHost(addr, buf_size);
+	if (error != CUDA_SUCCESS) {
+		printf("cuMemAllocHost error=%d\n", error);
+		return FAILURE;
+	}
+	cuda_ctx->cpu_bounce_buf_addr = *addr;
+
+	*can_init = true; // TEO_TODO: This could probably be true in our case
+
+	printf("CUDA bounce: gpu=%p, host_bounce=%p, buf_size=%ld\n",
+			cuda_ctx->gpu_bounce_buf_addr, cuda_ctx->cpu_bounce_buf_addr, buf_size);
+
+	return SUCCESS;
+}
+
 static int cuda_allocate_device_memory_buffer(struct cuda_memory_ctx *cuda_ctx, uint64_t size, int *dmabuf_fd,
 		uint64_t *dmabuf_offset, void **addr, bool *can_init) {
 	int error;
@@ -286,6 +364,7 @@ static int cuda_allocate_device_memory_buffer(struct cuda_memory_ctx *cuda_ctx, 
 	return CUDA_SUCCESS;
 }
 
+
 int cuda_memory_allocate_buffer(struct memory_ctx *ctx, int alignment, uint64_t size, int *dmabuf_fd,
 				uint64_t *dmabuf_offset, void **addr, bool *can_init) {
 	int error;
@@ -309,6 +388,13 @@ int cuda_memory_allocate_buffer(struct memory_ctx *ctx, int alignment, uint64_t 
 
 			*addr = (void *)d_ptr;
 			*can_init = false;
+			break;
+		case CUDA_MEM_BOUNCE:
+			error = cuda_allocate_bounce_buffer(cuda_ctx, size, dmabuf_fd, dmabuf_offset, addr, can_init);
+			if (error != SUCCESS) {
+				printf("Failed to alloacte bounce buffer: error=%d\n", error);
+				return FAILURE;
+			}
 			break;
 
 		case CUDA_MEM_MALLOC:
@@ -382,6 +468,14 @@ int cuda_memory_free_buffer(struct memory_ctx *ctx, int dmabuf_fd, void *addr, u
 		case CUDA_MEM_MALLOC:
 			free((void *) addr);
 			break;
+		case CUDA_MEM_BOUNCE:
+			CUdeviceptr d_A = (CUdeviceptr)cuda_ctx->gpu_bounce_buf_addr;
+			printf("deallocating GPU buffer %016llx\n", d_A);
+			p_cuMemFree(d_A);
+
+			printf("deallocating CPU buffer %p\n", addr);
+			p_cuMemFreeHost(cuda_ctx->cpu_bounce_buf_addr);
+			break;
 	}
 
 	return SUCCESS;
@@ -425,6 +519,10 @@ bool cuda_gpu_touch_supported() {
 #endif
 }
 
+// TEO
+bool cuda_bounce_buffer_active() {
+	return bounce_buffer_active;
+}
 
 static int ensure_kernel_plugin_loaded(void)
 {
@@ -554,6 +652,7 @@ static void cuda_validation_destroy(struct memory_ctx *ctx)
 struct memory_ctx *cuda_memory_create(struct perftest_parameters *params) {
 	struct cuda_memory_ctx *ctx;
 
+	// TEO_TODO: Are any of the existing functions incompatible with bounce buffer?
 	ALLOCATE(ctx, struct cuda_memory_ctx, 1);
 	memset(ctx, 0, sizeof(struct cuda_memory_ctx));
 	ctx->base.init = cuda_memory_init;
@@ -567,6 +666,7 @@ struct memory_ctx *cuda_memory_create(struct perftest_parameters *params) {
 	ctx->base.validation_start = cuda_validation_start;
 	ctx->base.validation_stop = cuda_validation_stop;
 	ctx->base.validation_destroy = cuda_validation_destroy;
+	ctx->base.copy_to_bounce_buffer = cuda_copy_to_bounce_buffer;
 	ctx->device_id = params->cuda_device_id;
 	ctx->device_bus_id = params->cuda_device_bus_id;
 	ctx->use_dmabuf = params->use_cuda_dmabuf;
